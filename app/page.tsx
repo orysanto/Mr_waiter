@@ -18,21 +18,40 @@ type RawMenuItem = {
   price?:       unknown;
 };
 
-// Map a dish name to a relevant food emoji
-function dishEmoji(name: string): string {
+// Map a dish name to a relevant food emoji, with index-based fallbacks so cards stay unique
+const FALLBACK_EMOJIS = ["😋", "🤤", "😍", "🧑‍🍳", "😄", "🤩"];
+
+function dishEmoji(name: string, index: number): string {
   const n = name.toLowerCase();
-  if (/pizza/.test(n))                            return "🍕";
-  if (/pasta|spaghetti|penne|rigatoni|fettuccine|tagliatelle/.test(n)) return "🍝";
-  if (/risotto/.test(n))                          return "🍚";
-  if (/salad|insalata/.test(n))                   return "🥗";
-  if (/soup|minestrone|zuppa/.test(n))            return "🍲";
-  if (/fish|salmon|tuna|branzino|sea bass/.test(n)) return "🐟";
-  if (/chicken|pollo/.test(n))                    return "🍗";
-  if (/beef|steak|bistecca|veal|vitello/.test(n)) return "🥩";
-  if (/dessert|tiramisu|panna|chocolate|gelato/.test(n)) return "🍰";
-  if (/bruschetta|antipasto|starter/.test(n))     return "🥖";
-  if (/wine|cocktail|drink|beverage/.test(n))     return "🍷";
-  return "🍽️";
+  if (/pizza/.test(n))                                                      return "🍕";
+  if (/pasta|spaghetti|penne|rigatoni|fettuccine|tagliatelle|linguine/.test(n)) return "🍝";
+  if (/risotto/.test(n))                                                    return "🫕";
+  if (/salad|insalata/.test(n))                                             return "🥗";
+  if (/soup|minestrone|zuppa|bisque/.test(n))                               return "🍲";
+  if (/salmon/.test(n))                                                     return "🍣";
+  if (/tuna/.test(n))                                                       return "🐟";
+  if (/branzino|sea bass|halibut|cod|fish/.test(n))                        return "🐠";
+  if (/shrimp|prawn|scallop|lobster|crab|seafood/.test(n))                 return "🦐";
+  if (/chicken|pollo/.test(n))                                              return "🍗";
+  if (/lamb|agnello/.test(n))                                               return "🥓";
+  if (/beef|steak|bistecca|veal|vitello|osso/.test(n))                     return "🥩";
+  if (/pork|pancetta|prosciutto|bacon/.test(n))                            return "🐷";
+  if (/tiramisu/.test(n))                                                   return "🍮";
+  if (/panna cotta/.test(n))                                                return "🍮";
+  if (/gelato|ice cream/.test(n))                                           return "🍨";
+  if (/chocolate|cioccolato/.test(n))                                       return "🍫";
+  if (/cake|torta|dessert|pastry|tart/.test(n))                            return "🎂";
+  if (/bruschetta|crostini/.test(n))                                        return "🥖";
+  if (/antipasto|charcuterie|board/.test(n))                               return "🧀";
+  if (/mushroom|funghi|truffle|tartufo/.test(n))                           return "🍄";
+  if (/eggplant|melanzane|zucchini|vegetable|verdure/.test(n))             return "🫑";
+  if (/tomato|pomodoro/.test(n))                                            return "🍅";
+  if (/cheese|parmigiana|mozzarella|burrata/.test(n))                      return "🧀";
+  if (/bread|focaccia|ciabatta|grissini/.test(n))                          return "🍞";
+  if (/wine|cocktail|drink|beverage|spritz|negroni/.test(n))               return "🍷";
+  if (/coffee|espresso|cappuccino/.test(n))                                return "☕";
+  // Unique face emoji fallback per card position so no two cards share the same icon
+  return FALLBACK_EMOJIS[index % FALLBACK_EMOJIS.length];
 }
 
 // Static review cards — representative sample
@@ -205,7 +224,7 @@ export default async function Home() {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {featuredDishes.map(dish => (
+            {featuredDishes.map((dish, i) => (
               <div
                 key={dish.id}
                 className="bg-white rounded-2xl shadow-sm border border-stone-100
@@ -215,7 +234,7 @@ export default async function Home() {
                 {/* Dish emoji header */}
                 <div className="h-36 bg-gradient-to-br from-amber-50 to-stone-100 flex items-center justify-center">
                   <span className="text-6xl group-hover:scale-110 transition-transform duration-200">
-                    {dishEmoji(dish.name)}
+                    {dishEmoji(dish.name, i)}
                   </span>
                 </div>
                 <div className="p-5">

@@ -28,3 +28,12 @@
 /* ── Hide scrollbars (Quick Actions row) ────────────────────────────────── */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* ── Quip bubble opacity transition ─────────────────────────────────────── */
+.quip-fade { transition: opacity 0.5s ease; }
+
+/* ── Quick Actions horizontal scrollbar ─────────────────────────────────── */
+.quick-actions-scroll::-webkit-scrollbar        { height: 3px; }
+.quick-actions-scroll::-webkit-scrollbar-track  { background: transparent; }
+.quick-actions-scroll::-webkit-scrollbar-thumb  { background: #d6b07a; border-radius: 99px; }
+.quick-actions-scroll                           { scrollbar-width: thin; scrollbar-color: #d6b07a transparent; }

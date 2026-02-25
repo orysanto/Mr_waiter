@@ -2,21 +2,29 @@
 // components/ChatWidget.tsx
 // Floating chat widget — mounts on every page via app/layout.tsx.
 // ALL business logic is preserved from the original implementation.
-// Modes: 'chat' | 'order' | 'confirmation' | 'compare' | 'reserve'
+// Modes: 'chat' | 'order' | 'confirmation' | 'compare' | 'reserve' | 'history'
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { getSupabaseBrowser } from "@/lib/supabaseBrowser";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type MenuItem  = { id: number; name: string; description: string; price: number };
-type Message   = { role: "user" | "assistant"; content: string; ts?: string };
-type Mode      = "chat" | "order" | "confirmation" | "compare" | "reserve";
+type ActionButton = { label: string; mode: Mode };
+type Message   = { role: "user" | "assistant"; content: string; ts?: string; actions?: ActionButton[] };
+type Mode      = "chat" | "order" | "confirmation" | "compare" | "reserve" | "history";
 
 // Cart actions returned by /api/chat — the model suggests them, the client validates & applies.
 type CartAction =
   | { type: "ADD_TO_CART";      itemName: string; qty: number }
   | { type: "REMOVE_FROM_CART"; itemName: string; qty: number }
   | { type: "CLEAR_CART" };
+
+// Past order returned by GET /api/orders/history
+type PastOrder = {
+  order_id:   string;
+  created_at: string;
+  items:      Array<{ name: string; qty: number; price?: number }>;
+};
 
 type Restaurant = {
   id:              string;
@@ -78,13 +86,31 @@ function WaiterAvatar({ size = 48 }: { size?: number }) {
   );
 }
 
+// ── Rotating quips shown in the speech bubble near the FAB ────────────────────
+const QUIPS = [
+  "Buona sera! Ready to order?",
+  "Tonight's special is not to miss!",
+  "Can I suggest a wine pairing?",
+  "Our truffle pasta is divine 🤌",
+  "Ask me anything about the menu!",
+  "Reservations available tonight!",
+  "Hungry? I can help you choose.",
+  "Every dish tells a story.",
+  "Let me be your guide tonight.",
+  "Our chef just added something new!",
+];
+
 // ── Tiny helpers ───────────────────────────────────────────────────────────────
 function nowTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function renderText(content: string) {
-  return content.split("\n").map((line, i, arr) => (
+  // Strip markdown bold (**text**) and italic (*text*) markers from AI responses
+  const cleaned = content
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1");
+  return cleaned.split("\n").map((line, i, arr) => (
     <span key={i}>{line}{i < arr.length - 1 && <br />}</span>
   ));
 }
@@ -114,6 +140,12 @@ export default function ChatWidget() {
   const [receiptStatus, setReceiptStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
   const [receiptError,  setReceiptError]  = useState("");
 
+  // Past orders — shared state used by the History tab and by the chat context builder
+  const [pastOrders,     setPastOrders]     = useState<PastOrder[]>([]);
+  // History tab state
+  const [historyEmail,   setHistoryEmail]   = useState("");
+  const [historyStatus,  setHistoryStatus]  = useState<"idle" | "loading" | "done">("idle");
+
   // Compare
   const [compareSelections, setCompareSelections] = useState<number[]>([]);
 
@@ -121,6 +153,10 @@ export default function ChatWidget() {
   const [reserveParty, setReserveParty] = useState(2);
   const [reserveDate,  setReserveDate]  = useState("");
   const [reserveTime,  setReserveTime]  = useState("19:00");
+
+  // Quip bubble
+  const [quipIndex,   setQuipIndex]   = useState(0);
+  const [quipVisible, setQuipVisible] = useState(true);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const modalRef  = useRef<HTMLDivElement>(null);
@@ -181,6 +217,19 @@ export default function ChatWidget() {
     }
   }, [isOpen, mode]);
 
+  // Cycle quips when chat is closed
+  useEffect(() => {
+    if (isOpen) return;
+    const interval = setInterval(() => {
+      setQuipVisible(false);
+      setTimeout(() => {
+        setQuipIndex(i => (i + 1) % QUIPS.length);
+        setQuipVisible(true);
+      }, 400);
+    }, 4500);
+    return () => clearInterval(interval);
+  }, [isOpen]);
+
   // ── Load restaurant + menu from Supabase on mount ───────────────────────────
   useEffect(() => {
     const id = process.env.NEXT_PUBLIC_RESTAURANT_ID;
@@ -235,36 +284,73 @@ export default function ChatWidget() {
 
     const q = text.toLowerCase();
 
-    if (/start order|place order|i want to order/i.test(q)) {
+    // Only auto-switch if the user is making a very explicit, direct request
+    // (e.g. typing exactly what the quick-action buttons say).
+    // For everything else, offer an inline button so the user stays in control.
+    if (/^\s*(start order|place order|open.*order|show.*order menu)\s*$/i.test(q)) {
       setIsTyping(false);
       setMode("order");
       setMessages(prev => [...prev, {
         role: "assistant",
-        content: "Great choice! Browse our menu below.\n\nTap + to add items, ✏️ for special requests, then Checkout when ready. 🛒",
+        content: "Here's our menu! Tap + to add items, ✏️ for special requests, then Checkout when ready. 🛒",
         ts: nowTime(),
       }]);
       return;
     }
 
-    if (/\bcompare\b|versus|\bvs\b/.test(q)) {
+    if (/^\s*(compare|compare dishes|open compare)\s*$/i.test(q)) {
       setIsTyping(false);
       setCompareSelections([]);
       setMode("compare");
       setMessages(prev => [...prev, {
         role: "assistant",
-        content: "Sure! Select any two dishes and I'll compare them side by side. 🍽️",
+        content: "Select any two dishes and I'll compare them side by side. 🍽️",
         ts: nowTime(),
       }]);
       return;
     }
 
-    if (/reserv|book.*table|table.*for|📅/i.test(q)) {
+    if (/^\s*(reserve|make a reservation|book a table|open reservation)\s*$/i.test(q)) {
       setIsTyping(false);
       setMode("reserve");
       setMessages(prev => [...prev, {
         role: "assistant",
-        content: "Let's get you a table! 📅 Pick your party size, date, and time below.",
+        content: "Let's get you a table! Pick your party size, date, and time below. 📅",
         ts: nowTime(),
+      }]);
+      return;
+    }
+
+    // Conversational mentions → offer a button, don't auto-switch
+    if (/\bi.*(want|like|love|need).*(to order|some food|to eat|the menu)\b|\bcan i order\b|\blet me order\b/i.test(q)) {
+      setIsTyping(false);
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: "Of course! Ready to browse the menu?",
+        ts: nowTime(),
+        actions: [{ label: "🛒 Open Menu & Order", mode: "order" }],
+      }]);
+      return;
+    }
+
+    if (/\bcompare\b.*\b(and|vs\.?|versus|or)\b|\bwhich (is better|do you prefer|would you recommend)\b|\bvs\.?\b/i.test(q)) {
+      setIsTyping(false);
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: "Great idea — want me to pull up the side-by-side comparison view?",
+        ts: nowTime(),
+        actions: [{ label: "⚖️ Compare Dishes", mode: "compare" }],
+      }]);
+      return;
+    }
+
+    if (/\b(book|reserve|make).{0,10}(table|reservation)\b|\b(table for|reservation for) \d\b/i.test(q)) {
+      setIsTyping(false);
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: "Happy to help! Want to open the reservation form?",
+        ts: nowTime(),
+        actions: [{ label: "📅 Reserve a Table", mode: "reserve" }],
       }]);
       return;
     }
@@ -279,6 +365,13 @@ export default function ChatWidget() {
       return;
     }
 
+    // Build a concise past-order context string if we have history
+    const pastCtx = pastOrders.length > 0
+      ? `Customer previously ordered: ${
+          [...new Set(pastOrders.flatMap(o => o.items.map(i => i.name)))].slice(0, 6).join(", ")
+        }.`
+      : undefined;
+
     try {
       const res  = await fetch("/api/chat", {
         method:  "POST",
@@ -290,6 +383,7 @@ export default function ChatWidget() {
           history: messages
             .slice(-10)
             .map(({ role, content }) => ({ role, content })),
+          ...(pastCtx && { pastOrderContext: pastCtx }),
         }),
       });
       const data = await res.json() as {
@@ -363,7 +457,7 @@ export default function ChatWidget() {
       setIsTyping(false);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [restaurant, messages]);
+  }, [restaurant, messages, pastOrders]);
 
   // ── Order helpers ─────────────────────────────────────────────────────────────
   const adjustQty = (id: number, delta: number) =>
@@ -454,6 +548,45 @@ export default function ChatWidget() {
     }
   };
 
+  // ── Past orders ───────────────────────────────────────────────────────────────
+
+  const fetchOrderHistory = useCallback(async (email: string) => {
+    if (!restaurant?.id) return;
+    setHistoryStatus("loading");
+    try {
+      const res  = await fetch(
+        `/api/orders/history?email=${encodeURIComponent(email)}&restaurant_id=${encodeURIComponent(restaurant.id)}`,
+      );
+      const data = await res.json() as { orders?: PastOrder[] };
+      setPastOrders(Array.isArray(data.orders) ? data.orders : []);
+    } catch {
+      setPastOrders([]);
+    } finally {
+      setHistoryStatus("done");
+    }
+  }, [restaurant]);
+
+  /** Re-populate the cart with a past order's items then switch to order mode. */
+  const reAddOrder = useCallback((items: PastOrder["items"]) => {
+    const lookup = new Map(menu.map(item => [item.name.toLowerCase(), item]));
+    const newQty: Record<number, number> = {};
+    for (const pastItem of items) {
+      const found = lookup.get(pastItem.name.toLowerCase());
+      if (found) newQty[found.id] = Math.min(10, (newQty[found.id] ?? 0) + (pastItem.qty ?? 1));
+    }
+    setQuantities(newQty);
+    setAdjustments({});
+    setAdjustingItem(null);
+    setAdjustInput("");
+    setOrderId("");
+    setReceiptEmail("");
+    setReceiptStatus("idle");
+    setReceiptError("");
+    setCompareSelections([]);
+    setMode("order");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menu]);
+
   // ── Compare helpers ───────────────────────────────────────────────────────────
   const toggleCompare = (id: number) => {
     setCompareSelections(prev => {
@@ -468,23 +601,56 @@ export default function ChatWidget() {
 
   // ── Quick actions (shown at top of chat mode) ─────────────────────────────────
   // `sends` overrides the message sent to the AI (label is used as fallback).
-  const QUICK_ACTIONS: { icon: string; label: string; sends?: string }[] = [
+  const QUICK_ACTIONS: { icon: string; label: string; sends?: string; switchTo?: Mode }[] = [
     { icon: "🕐", label: "Hours"           },
     { icon: "📍", label: "Location"        },
     { icon: "🍽️", label: "Menu"            },
-    { icon: "📅", label: "Reserve"         },
-    { icon: "🛒", label: "Start order"     },
+    { icon: "📅", label: "Reserve",        switchTo: "reserve"  },
+    { icon: "🛒", label: "Start order",    switchTo: "order"    },
     {
       icon:  "✨",
       label: "Recommendations",
       sends: "Can you recommend something from the menu?",
     },
-    { icon: "⚖️", label: "Compare"         },
+    { icon: "⚖️", label: "Compare",        switchTo: "compare"  },
+    { icon: "📋", label: "Past orders",    switchTo: "history"  },
   ];
 
   // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <>
+      {/* ── Quip speech bubble ─────────────────────────────────────────────── */}
+      {!isOpen && (
+        <div
+          aria-hidden="true"
+          className={`
+            fixed z-50 bottom-[42px] right-[108px]
+            hidden sm:block
+            max-w-[200px]
+            bg-white rounded-2xl
+            shadow-md border border-stone-200
+            px-3.5 py-2.5
+            pointer-events-none
+            transition-opacity duration-500
+            ${quipVisible ? "opacity-100" : "opacity-0"}
+          `}
+        >
+          <p className="text-stone-700 text-[11px] font-medium leading-snug">
+            {QUIPS[quipIndex]}
+          </p>
+          {/* Arrow pointing right toward the FAB */}
+          <span
+            className="absolute top-1/2 -translate-y-1/2 -right-[7px]"
+            style={{
+              width: 0, height: 0,
+              borderTop: "6px solid transparent",
+              borderBottom: "6px solid transparent",
+              borderLeft: "7px solid white",
+            }}
+          />
+        </div>
+      )}
+
       {/* ── Floating trigger button ────────────────────────────────────────── */}
       <button
         id="chat-open-btn"
@@ -492,15 +658,15 @@ export default function ChatWidget() {
         aria-label={isOpen ? "Close AI Waiter chat" : "Open AI Waiter chat"}
         className={`
           fixed bottom-6 right-6 z-50
-          w-16 h-16 rounded-full
-          shadow-2xl shadow-amber-900/40
+          w-20 h-20 rounded-full
+          shadow-xl shadow-stone-900/40
           flex items-center justify-center
-          border-2 border-amber-400/40
-          transition-all duration-200 hover:scale-110 active:scale-95
+          border border-amber-600/25
+          transition-all duration-200 hover:scale-105 active:scale-95
           overflow-hidden
           ${isOpen
             ? "bg-stone-800 hover:bg-stone-700"
-            : "bg-gradient-to-br from-amber-500 to-amber-700 hover:from-amber-400 hover:to-amber-600"
+            : "bg-gradient-to-b from-amber-700 to-stone-900 hover:from-amber-600 hover:to-stone-800"
           }
         `}
       >
@@ -510,7 +676,7 @@ export default function ChatWidget() {
             <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
           </svg>
         ) : (
-          <WaiterAvatar size={54} />
+          <WaiterAvatar size={62} />
         )}
       </button>
 
@@ -522,7 +688,7 @@ export default function ChatWidget() {
           aria-label="AI Waiter chat"
           aria-modal="true"
           className="
-            fixed bottom-[88px] right-5 z-50
+            fixed bottom-[100px] right-5 z-50
             w-[94vw] sm:w-[460px]
             h-[82vh]  max-h-[680px]
             bg-white rounded-2xl
@@ -609,23 +775,38 @@ export default function ChatWidget() {
           ══════════════════════════════════════════════════════════════ */}
           {mode === "chat" && (
             <>
-              {/* Quick Actions bar */}
-              <div className="px-3 py-2.5 flex gap-2 overflow-x-auto no-scrollbar
-                              border-b border-stone-100 bg-stone-50/80 shrink-0">
-                {QUICK_ACTIONS.map(a => (
-                  <button
-                    key={a.label}
-                    onClick={() => send(a.sends ?? a.label)}
-                    className="flex items-center gap-1.5 shrink-0 text-[11px] font-semibold
-                               bg-white hover:bg-amber-50 text-stone-600 hover:text-amber-700
-                               border border-stone-200 hover:border-amber-300
-                               rounded-xl px-2.5 py-1.5 transition-colors whitespace-nowrap
-                               shadow-sm"
-                  >
-                    <span>{a.icon}</span>
-                    <span>{a.label}</span>
-                  </button>
-                ))}
+              {/* Quick Actions bar — scroll-fade indicator shows there are more buttons */}
+              <div className="relative border-b border-stone-100 shrink-0">
+                <div className="px-3 pt-2.5 pb-1.5 flex gap-2 overflow-x-auto quick-actions-scroll
+                                bg-stone-50/80">
+                  {QUICK_ACTIONS.map(a => (
+                    <button
+                      key={a.label}
+                      onClick={() => {
+                        if (a.switchTo) {
+                          if (a.switchTo === "compare") setCompareSelections([]);
+                          setMode(a.switchTo);
+                        } else {
+                          send(a.sends ?? a.label);
+                        }
+                      }}
+                      className="flex items-center gap-1.5 shrink-0 text-[11px] font-semibold
+                                 bg-white hover:bg-amber-50 text-stone-600 hover:text-amber-700
+                                 border border-stone-200 hover:border-amber-300
+                                 rounded-xl px-2.5 py-1.5 transition-colors whitespace-nowrap
+                                 shadow-sm"
+                    >
+                      <span>{a.icon}</span>
+                      <span>{a.label}</span>
+                    </button>
+                  ))}
+                </div>
+                {/* Right-edge fade + chevron: signals more content to scroll */}
+                <div className="absolute right-0 top-0 bottom-0 w-8
+                                bg-gradient-to-l from-stone-100 to-transparent
+                                pointer-events-none flex items-center justify-end pr-1">
+                  <span className="text-stone-400 text-xs font-black leading-none">›</span>
+                </div>
               </div>
 
               {/* Messages */}
@@ -687,6 +868,27 @@ export default function ChatWidget() {
                         }`}>
                           {msg.ts}
                         </p>
+                      )}
+                      {/* Inline action buttons — only on assistant messages */}
+                      {msg.role === "assistant" && msg.actions && msg.actions.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-1.5">
+                          {msg.actions.map((action, j) => (
+                            <button
+                              key={j}
+                              onClick={() => {
+                                if (action.mode === "compare") setCompareSelections([]);
+                                setMode(action.mode);
+                              }}
+                              className="text-[11px] font-semibold
+                                         bg-amber-50 hover:bg-amber-100 active:bg-amber-200
+                                         text-amber-700 hover:text-amber-900
+                                         border border-amber-200 hover:border-amber-400
+                                         px-3 py-1.5 rounded-full transition-colors shadow-sm"
+                            >
+                              {action.label}
+                            </button>
+                          ))}
+                        </div>
                       )}
                     </div>
                     {msg.role === "user" && (
@@ -1145,6 +1347,130 @@ export default function ChatWidget() {
               )}
 
               <div className="text-center py-1 shrink-0">
+                <p className="text-[10px] text-stone-400 tracking-wide">Powered by AI</p>
+              </div>
+            </div>
+          )}
+
+          {/* ══════════════════════════════════════════════════════════════
+              HISTORY MODE — email lookup → past orders + Re-add
+          ══════════════════════════════════════════════════════════════ */}
+          {mode === "history" && (
+            <div className="flex-1 overflow-y-auto px-5 py-5 flex flex-col gap-4 bg-stone-50">
+
+              {/* Header */}
+              <div className="flex items-center gap-3 bg-white rounded-2xl border border-stone-100
+                              shadow-sm px-4 py-3.5">
+                <div className="w-10 h-10 rounded-full bg-amber-50 border border-amber-200
+                                flex items-center justify-center shrink-0 text-xl">
+                  📋
+                </div>
+                <div>
+                  <p className="font-bold text-stone-800 text-sm">Past Orders</p>
+                  <p className="text-xs text-stone-400 leading-relaxed mt-0.5">
+                    Enter your email to view your order history.
+                  </p>
+                </div>
+              </div>
+
+              {/* Email lookup */}
+              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-4 py-4">
+                <p className="text-[11px] font-bold text-stone-500 uppercase tracking-widest mb-3">
+                  📧 Your Email
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="email"
+                    value={historyEmail}
+                    onChange={e => {
+                      setHistoryEmail(e.target.value);
+                      if (historyStatus === "done") setHistoryStatus("idle");
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === "Enter" && historyEmail.trim())
+                        fetchOrderHistory(historyEmail.trim());
+                    }}
+                    placeholder="your@email.com"
+                    disabled={historyStatus === "loading"}
+                    className="flex-1 text-sm border border-stone-200 bg-stone-50 rounded-full
+                               px-4 py-2 focus:outline-none focus:ring-2 focus:ring-amber-400
+                               disabled:opacity-50 placeholder:text-stone-400"
+                  />
+                  <button
+                    onClick={() => { if (historyEmail.trim()) fetchOrderHistory(historyEmail.trim()); }}
+                    disabled={!historyEmail.trim() || historyStatus === "loading"}
+                    className="text-xs font-bold bg-amber-600 hover:bg-amber-700
+                               disabled:opacity-40 text-white px-4 py-2 rounded-full
+                               shrink-0 transition-colors active:scale-95"
+                  >
+                    {historyStatus === "loading" ? "Looking…" : "Look up"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Results */}
+              {historyStatus === "done" && (
+                pastOrders.length === 0 ? (
+                  <div className="bg-white rounded-2xl border border-stone-100 shadow-sm
+                                  px-4 py-8 text-center">
+                    <p className="text-3xl mb-2">🍽️</p>
+                    <p className="text-sm font-semibold text-stone-500">No past orders found.</p>
+                    <p className="text-xs text-stone-400 mt-1">Try a different email address.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <p className="text-[11px] font-bold text-stone-400 uppercase tracking-widest px-1">
+                      {pastOrders.length} order{pastOrders.length !== 1 ? "s" : ""} found
+                    </p>
+                    {pastOrders.map(order => {
+                      const date = new Date(order.created_at).toLocaleDateString("en-US", {
+                        month: "long", day: "numeric", year: "numeric",
+                      });
+                      return (
+                        <div key={order.order_id}
+                             className="bg-white rounded-2xl border border-stone-100 shadow-sm overflow-hidden">
+                          {/* Order header */}
+                          <div className="flex items-center justify-between px-4 py-3
+                                          border-b border-stone-50">
+                            <div>
+                              <p className="text-xs font-bold text-stone-700">{date}</p>
+                              <p className="text-[10px] text-stone-400 mt-0.5 font-mono">
+                                #{order.order_id.slice(0, 8).toUpperCase()}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => reAddOrder(order.items)}
+                              className="text-[11px] font-bold bg-amber-600 hover:bg-amber-700
+                                         text-white px-3 py-1.5 rounded-full
+                                         transition-colors active:scale-95"
+                            >
+                              Re-add to cart
+                            </button>
+                          </div>
+                          {/* Item list */}
+                          <div className="px-4 py-3 space-y-1">
+                            {order.items.map((item, j) => (
+                              <div key={j} className="flex justify-between text-xs text-stone-600">
+                                <span>{item.qty}× {item.name}</span>
+                                {item.price != null && (
+                                  <span className="text-stone-400 tabular-nums">
+                                    ${(item.price * item.qty).toFixed(2)}
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <p className="text-[10px] text-stone-400 text-center pt-1">
+                      &ldquo;Re-add to cart&rdquo; loads that order into the menu — you can edit before checkout.
+                    </p>
+                  </div>
+                )
+              )}
+
+              <div className="text-center py-1 mt-auto shrink-0">
                 <p className="text-[10px] text-stone-400 tracking-wide">Powered by AI</p>
               </div>
             </div>

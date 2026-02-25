@@ -95,6 +95,43 @@ function buildMenuBlock(
 }
 
 /**
+ * Serialise a JSONB column (array or plain object) to a human-readable string
+ * for injection into the system prompt.
+ *   - Array of { q, a }                → Q&A list
+ *   - Array of { title, price?, description? } → specials bullet list
+ *   - Plain object                     → "Label: value" pairs
+ *   - String                           → returned as-is
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function serialiseJsonb(value: any): string {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    return value.map((item) => {
+      if (typeof item !== "object" || item === null) return String(item);
+      if ("q" in item && "a" in item)
+        return `Q: ${item.q}\nA: ${item.a}`;
+      if ("title" in item) {
+        const price = typeof item.price === "number" ? ` ($${(item.price as number).toFixed(2)})` : "";
+        const desc  = item.description ? ` — ${item.description}` : "";
+        return `- ${item.title}${price}${desc}`;
+      }
+      return JSON.stringify(item);
+    }).join("\n\n");
+  }
+
+  if (typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([k, v]) => `${k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}: ${v}`)
+      .join("\n");
+  }
+
+  return String(value);
+}
+
+/**
  * Sanitise history coming from the client:
  *   - Strip unknown fields (e.g. `ts`) so Anthropic SDK never sees them.
  *   - Drop leading assistant messages — Anthropic requires the first turn to be "user".
@@ -119,10 +156,11 @@ function sanitiseHistory(
 // ── Route handler ─────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   try {
-    const { restaurant_id, message, history = [] } = (await req.json()) as {
-      restaurant_id: string;
-      message:       string;
-      history?:      RawMessage[];
+    const { restaurant_id, message, history = [], pastOrderContext } = (await req.json()) as {
+      restaurant_id:      string;
+      message:            string;
+      history?:           RawMessage[];
+      pastOrderContext?:  string; // "Customer previously ordered: X, Y, Z."
     };
 
     if (!restaurant_id || !message?.trim()) {
@@ -136,7 +174,7 @@ export async function POST(req: NextRequest) {
     const supabase = createServerClient();
     const { data: r, error } = await supabase
       .from("restaurants")
-      .select("name, hours, address, phone, reservation_url, menu_items, menu_text")
+      .select("name, hours, address, phone, reservation_url, menu_items, menu_text, faqs, policies, specials, service_info")
       .eq("id", restaurant_id)
       .single();
 
@@ -207,8 +245,13 @@ Phone: ${r.phone}
 Reservations: ${r.reservation_url ?? "Please call us to book a table."}
 
 MENU:
-${menuBlock}
-</restaurant_data>`;
+${menuBlock}${serialiseJsonb(r.specials)     ? `\n\nTODAY'S SPECIALS:\n${serialiseJsonb(r.specials)}`         : ""}${serialiseJsonb(r.faqs)         ? `\n\nFREQUENTLY ASKED QUESTIONS:\n${serialiseJsonb(r.faqs)}`   : ""}${serialiseJsonb(r.policies)     ? `\n\nPOLICIES:\n${serialiseJsonb(r.policies)}`                   : ""}${serialiseJsonb(r.service_info) ? `\n\nSERVICE INFO:\n${serialiseJsonb(r.service_info)}`             : ""}
+</restaurant_data>${pastOrderContext ? `
+
+<customer_history>
+${pastOrderContext}
+When the guest asks for a recommendation, use this to personalise your suggestion — e.g. "Last time you enjoyed X; you might also like Y." Only reference items that exist in MENU DATA.
+</customer_history>` : ""}`;
 
     // ── Build clean message list for Anthropic ────────────────────────────────
     const messages: Anthropic.MessageParam[] = [
