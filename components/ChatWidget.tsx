@@ -12,6 +12,12 @@ type MenuItem  = { id: number; name: string; description: string; price: number 
 type Message   = { role: "user" | "assistant"; content: string; ts?: string };
 type Mode      = "chat" | "order" | "confirmation" | "compare" | "reserve";
 
+// Cart actions returned by /api/chat — the model suggests them, the client validates & applies.
+type CartAction =
+  | { type: "ADD_TO_CART";      itemName: string; qty: number }
+  | { type: "REMOVE_FROM_CART"; itemName: string; qty: number }
+  | { type: "CLEAR_CART" };
+
 type Restaurant = {
   id:              string;
   name:            string;
@@ -102,6 +108,11 @@ export default function ChatWidget() {
   const [adjustInput,   setAdjustInput]   = useState("");
   const [orderId,       setOrderId]       = useState("");
   const [isCheckingOut, setIsCheckingOut] = useState(false);
+
+  // Email receipt
+  const [receiptEmail,  setReceiptEmail]  = useState("");
+  const [receiptStatus, setReceiptStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  const [receiptError,  setReceiptError]  = useState("");
 
   // Compare
   const [compareSelections, setCompareSelections] = useState<number[]>([]);
@@ -275,15 +286,73 @@ export default function ChatWidget() {
         body: JSON.stringify({
           restaurant_id: restaurant.id,
           message:       text,
-          history:       messages.slice(-6),
+          // Strip UI-only fields (e.g. `ts`) so the API only receives {role, content}
+          history: messages
+            .slice(-10)
+            .map(({ role, content }) => ({ role, content })),
         }),
       });
-      const data = await res.json();
-      setMessages(prev => [...prev, {
-        role:    "assistant",
-        content: data.reply ?? data.error ?? "Sorry, I had trouble with that. Please try again.",
-        ts:      nowTime(),
-      }]);
+      const data = await res.json() as {
+        reply?:   string;
+        error?:   string;
+        actions?: CartAction[];
+      };
+      const reply = data.reply ?? data.error ?? "Sorry, I had trouble with that. Please try again.";
+
+      // ── Apply AI-requested cart actions (client-side validation) ────────────
+      if (Array.isArray(data.actions) && data.actions.length > 0 && menu.length > 0) {
+        // Case-insensitive name → MenuItem lookup
+        const lookup = new Map(menu.map(item => [item.name.toLowerCase(), item]));
+
+        const applied: string[] = [];   // e.g. ["2 × Margherita"]
+        const skipped: string[] = [];   // items the model named but aren't on the menu
+        const qtyDeltas: Record<number, number> = {};
+
+        for (const action of data.actions) {
+          if (action.type === "ADD_TO_CART") {
+            const item = lookup.get(action.itemName.toLowerCase());
+            if (!item) { skipped.push(action.itemName); continue; }
+            // Clamp quantity to 1–10
+            const qty = Math.min(10, Math.max(1, Math.floor(action.qty)));
+            qtyDeltas[item.id] = (qtyDeltas[item.id] ?? 0) + qty;
+            applied.push(`${qty} × ${item.name}`);
+          }
+          // REMOVE_FROM_CART / CLEAR_CART can be wired up here in future
+        }
+
+        // Apply all quantity increments atomically
+        if (Object.keys(qtyDeltas).length > 0) {
+          setQuantities(prev => {
+            const next = { ...prev };
+            for (const [idStr, delta] of Object.entries(qtyDeltas)) {
+              const id = Number(idStr);
+              next[id] = Math.min(10, (next[id] ?? 0) + delta);
+            }
+            return next;
+          });
+        }
+
+        // Build reply + confirmation messages
+        const newMsgs: Message[] = [{ role: "assistant", content: reply, ts: nowTime() }];
+        if (applied.length > 0) {
+          newMsgs.push({
+            role:    "assistant",
+            content: `✅ Added to your order: ${applied.join(", ")}. Tap 🛒 "Start order" to review your cart!`,
+            ts:      nowTime(),
+          });
+        }
+        if (skipped.length > 0) {
+          newMsgs.push({
+            role:    "assistant",
+            content: `⚠️ I couldn't find on the menu: ${skipped.join(", ")}. Could you double-check the item name?`,
+            ts:      nowTime(),
+          });
+        }
+        setMessages(prev => [...prev, ...newMsgs]);
+      } else {
+        // No actions — normal chat response
+        setMessages(prev => [...prev, { role: "assistant", content: reply, ts: nowTime() }]);
+      }
     } catch {
       setMessages(prev => [...prev, {
         role:    "assistant",
@@ -350,7 +419,39 @@ export default function ChatWidget() {
     setAdjustInput("");
     setOrderId("");
     setCompareSelections([]);
+    // Reset receipt form so it's fresh on the next order
+    setReceiptEmail("");
+    setReceiptStatus("idle");
+    setReceiptError("");
     setMode("order");
+  };
+
+  // ── Email receipt ─────────────────────────────────────────────────────────────
+  const sendReceipt = async () => {
+    // Client-side format check before hitting the server
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(receiptEmail.trim())) {
+      setReceiptError("Please enter a valid email address.");
+      return;
+    }
+    setReceiptStatus("sending");
+    setReceiptError("");
+    try {
+      const res  = await fetch("/api/receipt", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ order_id: orderId, email: receiptEmail.trim() }),
+      });
+      const data = await res.json() as { ok: boolean; error?: string };
+      if (!data.ok) {
+        setReceiptError(data.error ?? "Something went wrong. Please try again.");
+        setReceiptStatus("error");
+      } else {
+        setReceiptStatus("sent");
+      }
+    } catch {
+      setReceiptError("Network error. Please try again.");
+      setReceiptStatus("error");
+    }
   };
 
   // ── Compare helpers ───────────────────────────────────────────────────────────
@@ -366,14 +467,19 @@ export default function ChatWidget() {
     .filter((m): m is MenuItem => !!m);
 
   // ── Quick actions (shown at top of chat mode) ─────────────────────────────────
-  const QUICK_ACTIONS = [
-    { icon: "🕐", label: "Hours"       },
-    { icon: "📍", label: "Location"    },
-    { icon: "🍽️", label: "Menu"        },
-    { icon: "📅", label: "Reserve"     },
-    { icon: "🛒", label: "Start order" },
-    { icon: "💡", label: "Recommend"   },
-    { icon: "⚖️", label: "Compare"     },
+  // `sends` overrides the message sent to the AI (label is used as fallback).
+  const QUICK_ACTIONS: { icon: string; label: string; sends?: string }[] = [
+    { icon: "🕐", label: "Hours"           },
+    { icon: "📍", label: "Location"        },
+    { icon: "🍽️", label: "Menu"            },
+    { icon: "📅", label: "Reserve"         },
+    { icon: "🛒", label: "Start order"     },
+    {
+      icon:  "✨",
+      label: "Recommendations",
+      sends: "Can you recommend something from the menu?",
+    },
+    { icon: "⚖️", label: "Compare"         },
   ];
 
   // ── Render ────────────────────────────────────────────────────────────────────
@@ -509,7 +615,7 @@ export default function ChatWidget() {
                 {QUICK_ACTIONS.map(a => (
                   <button
                     key={a.label}
-                    onClick={() => send(a.label)}
+                    onClick={() => send(a.sends ?? a.label)}
                     className="flex items-center gap-1.5 shrink-0 text-[11px] font-semibold
                                bg-white hover:bg-amber-50 text-stone-600 hover:text-amber-700
                                border border-stone-200 hover:border-amber-300
@@ -1102,10 +1208,59 @@ export default function ChatWidget() {
                 </div>
               </div>
 
-              <p className="text-xs text-stone-400 text-center leading-relaxed mb-6">
+              <p className="text-xs text-stone-400 text-center leading-relaxed mb-5">
                 Your meal will be ready shortly. 🍷<br />
                 Enjoy your dining experience!
               </p>
+
+              {/* ── Email receipt ──────────────────────────────────────────── */}
+              <div className="w-full bg-white rounded-2xl border border-stone-100 shadow-sm px-4 py-4 mb-4">
+                <p className="text-[11px] font-bold text-stone-500 uppercase tracking-widest mb-3">
+                  📧 Email Receipt
+                </p>
+
+                {/* Sent state */}
+                {receiptStatus === "sent" ? (
+                  <p className="text-sm text-green-600 font-semibold text-center py-1">
+                    ✅ Sent! Check your inbox.
+                  </p>
+                ) : (
+                  <>
+                    <div className="flex gap-2">
+                      <input
+                        type="email"
+                        value={receiptEmail}
+                        onChange={e => {
+                          setReceiptEmail(e.target.value);
+                          setReceiptError(""); // clear error on edit
+                        }}
+                        onKeyDown={e => {
+                          if (e.key === "Enter" && receiptStatus !== "sending") sendReceipt();
+                        }}
+                        placeholder="your@email.com"
+                        disabled={receiptStatus === "sending"}
+                        className="flex-1 text-sm border border-stone-200 bg-stone-50 rounded-full
+                                   px-4 py-2 focus:outline-none focus:ring-2 focus:ring-amber-400
+                                   disabled:opacity-50 placeholder:text-stone-400"
+                      />
+                      <button
+                        onClick={sendReceipt}
+                        disabled={receiptStatus === "sending" || !receiptEmail.trim()}
+                        className="text-xs font-bold bg-amber-600 hover:bg-amber-700
+                                   disabled:opacity-40 text-white px-4 py-2 rounded-full
+                                   shrink-0 transition-colors active:scale-95"
+                      >
+                        {receiptStatus === "sending" ? "Sending…" : "Send"}
+                      </button>
+                    </div>
+
+                    {/* Inline error */}
+                    {receiptError && (
+                      <p className="text-xs text-red-500 mt-2 ml-1">{receiptError}</p>
+                    )}
+                  </>
+                )}
+              </div>
 
               <button
                 onClick={resetAll}
