@@ -115,6 +115,72 @@ function renderText(content: string) {
   ));
 }
 
+// ── Reservation parsing helpers ──────────────────────────────────────────────
+const RESERVE_SLOTS = ["17:30","18:00","18:30","19:00","19:30","20:00","20:30","21:00","21:30"];
+const MONTH_MAP: Record<string, string> = {
+  jan:"01", feb:"02", mar:"03", apr:"04", may:"05", jun:"06",
+  jul:"07", aug:"08", sep:"09", oct:"10", nov:"11", dec:"12",
+};
+
+function parseReservationDetails(text: string): { party?: number; date?: string; time?: string } {
+  const result: { party?: number; date?: string; time?: string } = {};
+
+  // Party size: "for 4", "party of 3", "4 people", "table for 2"
+  const partyMatch = text.match(/\b(?:for|party of|table for)\s+(\d+)|(\d+)\s*(?:people|persons?|guests?|of us)\b/i);
+  if (partyMatch) {
+    const n = parseInt(partyMatch[1] ?? partyMatch[2], 10);
+    if (n >= 1 && n <= 20) result.party = n;
+  }
+
+  // Date: "March 5th", "March 5", "3/5", "03/05/2026"
+  const monthMatch = text.match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i
+  );
+  if (monthMatch) {
+    const key = monthMatch[1].slice(0, 3).toLowerCase();
+    const day = String(parseInt(monthMatch[2], 10)).padStart(2, "0");
+    result.date = `${new Date().getFullYear()}-${MONTH_MAP[key]}-${day}`;
+  } else {
+    const numDate = text.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+    if (numDate) {
+      const month = String(parseInt(numDate[1], 10)).padStart(2, "0");
+      const day   = String(parseInt(numDate[2], 10)).padStart(2, "0");
+      const year  = numDate[3]
+        ? (numDate[3].length === 2 ? `20${numDate[3]}` : numDate[3])
+        : String(new Date().getFullYear());
+      result.date = `${year}-${month}-${day}`;
+    }
+  }
+
+  // Time: "7pm", "7:30 PM" → snapped to nearest available slot
+  const timeMatch = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1], 10);
+    const m = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+    const p = timeMatch[3].toLowerCase();
+    if (p === "pm" && h !== 12) h += 12;
+    if (p === "am" && h === 12) h = 0;
+    const totalMins = h * 60 + m;
+    result.time = RESERVE_SLOTS.reduce((best, slot) => {
+      const [sh, sm] = slot.split(":").map(Number);
+      const [bh, bm] = best.split(":").map(Number);
+      return Math.abs(totalMins - (sh * 60 + sm)) < Math.abs(totalMins - (bh * 60 + bm)) ? slot : best;
+    }, RESERVE_SLOTS[0]);
+  }
+
+  return result;
+}
+
+function formatReserveDate(iso: string): string {
+  try { return new Date(`${iso}T12:00:00`).toLocaleDateString("en-US", { month: "long", day: "numeric" }); }
+  catch { return iso; }
+}
+
+function formatReserveTime(slot: string): string {
+  const [h, m] = slot.split(":").map(Number);
+  return `${h > 12 ? h - 12 : h === 0 ? 12 : h}:${String(m).padStart(2, "0")} ${h >= 12 ? "PM" : "AM"}`;
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 export default function ChatWidget() {
   // ── State ──────────────────────────────────────────────────────────────────
@@ -344,14 +410,32 @@ export default function ChatWidget() {
       return;
     }
 
-    if (/\b(book|reserve|make).{0,10}(table|reservation)\b|\b(table for|reservation for) \d\b/i.test(q)) {
+    if (/\b(book|reserve|make).{0,10}(table|reservation)\b|\b(table for|reservation for)\s*\d\b/i.test(q)) {
+      const parsed = parseReservationDetails(text);
+      if (parsed.party !== undefined) setReserveParty(parsed.party);
+      if (parsed.date)                setReserveDate(parsed.date);
+      if (parsed.time)                setReserveTime(parsed.time);
+      const hasAll = parsed.party !== undefined && parsed.date !== undefined && parsed.time !== undefined;
       setIsTyping(false);
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: "Happy to help! Want to open the reservation form?",
-        ts: nowTime(),
-        actions: [{ label: "📅 Reserve a Table", mode: "reserve" }],
-      }]);
+      if (hasAll) {
+        setMode("reserve");
+        setMessages(prev => [...prev, {
+          role: "assistant",
+          content: `All set! I've pre-filled a table for ${parsed.party} on ${formatReserveDate(parsed.date!)} at ${formatReserveTime(parsed.time!)} — review and confirm below! 📅`,
+          ts: nowTime(),
+        }]);
+      } else {
+        const missing: string[] = [];
+        if (parsed.party === undefined) missing.push("party size");
+        if (!parsed.date)               missing.push("date");
+        if (!parsed.time)               missing.push("preferred time");
+        setMessages(prev => [...prev, {
+          role: "assistant",
+          content: `Happy to help you book a table! Just let me know your ${missing.join(" and ")} and I'll get everything set up.`,
+          ts: nowTime(),
+          actions: [{ label: "📅 Open Reservation Form", mode: "reserve" }],
+        }]);
+      }
       return;
     }
 
@@ -398,29 +482,41 @@ export default function ChatWidget() {
         // Case-insensitive name → MenuItem lookup
         const lookup = new Map(menu.map(item => [item.name.toLowerCase(), item]));
 
-        const applied: string[] = [];   // e.g. ["2 × Margherita"]
-        const skipped: string[] = [];   // items the model named but aren't on the menu
+        const applied: string[] = [];
+        const removed: string[] = [];
+        const skipped: string[] = [];
         const qtyDeltas: Record<number, number> = {};
+        let   shouldClear = false;
 
         for (const action of data.actions) {
           if (action.type === "ADD_TO_CART") {
             const item = lookup.get(action.itemName.toLowerCase());
             if (!item) { skipped.push(action.itemName); continue; }
-            // Clamp quantity to 1–10
             const qty = Math.min(10, Math.max(1, Math.floor(action.qty)));
             qtyDeltas[item.id] = (qtyDeltas[item.id] ?? 0) + qty;
             applied.push(`${qty} × ${item.name}`);
+          } else if (action.type === "REMOVE_FROM_CART") {
+            const item = lookup.get(action.itemName.toLowerCase());
+            if (!item) { skipped.push(action.itemName); continue; }
+            const qty = Math.min(10, Math.max(1, Math.floor(action.qty)));
+            qtyDeltas[item.id] = (qtyDeltas[item.id] ?? 0) - qty;
+            removed.push(`${qty} × ${item.name}`);
+          } else if (action.type === "CLEAR_CART") {
+            shouldClear = true;
           }
-          // REMOVE_FROM_CART / CLEAR_CART can be wired up here in future
         }
 
-        // Apply all quantity increments atomically
-        if (Object.keys(qtyDeltas).length > 0) {
+        // Apply atomically — removals clamp to 0 and drop the key
+        if (shouldClear) {
+          setQuantities({});
+        } else if (Object.keys(qtyDeltas).length > 0) {
           setQuantities(prev => {
             const next = { ...prev };
             for (const [idStr, delta] of Object.entries(qtyDeltas)) {
               const id = Number(idStr);
-              next[id] = Math.min(10, (next[id] ?? 0) + delta);
+              const newQty = (next[id] ?? 0) + delta;
+              if (newQty <= 0) delete next[id];
+              else next[id] = Math.min(10, newQty);
             }
             return next;
           });
@@ -432,6 +528,20 @@ export default function ChatWidget() {
           newMsgs.push({
             role:    "assistant",
             content: `✅ Added to your order: ${applied.join(", ")}. Tap 🛒 "Start order" to review your cart!`,
+            ts:      nowTime(),
+          });
+        }
+        if (removed.length > 0) {
+          newMsgs.push({
+            role:    "assistant",
+            content: `✅ Removed from your order: ${removed.join(", ")}.`,
+            ts:      nowTime(),
+          });
+        }
+        if (shouldClear) {
+          newMsgs.push({
+            role:    "assistant",
+            content: `✅ Your cart has been cleared.`,
             ts:      nowTime(),
           });
         }
@@ -566,7 +676,7 @@ export default function ChatWidget() {
     }
   }, [restaurant]);
 
-  /** Re-populate the cart with a past order's items then switch to order mode. */
+  /** Merge a past order's items into the existing cart then switch to order mode. */
   const reAddOrder = useCallback((items: PastOrder["items"]) => {
     const lookup = new Map(menu.map(item => [item.name.toLowerCase(), item]));
     const newQty: Record<number, number> = {};
@@ -574,7 +684,15 @@ export default function ChatWidget() {
       const found = lookup.get(pastItem.name.toLowerCase());
       if (found) newQty[found.id] = Math.min(10, (newQty[found.id] ?? 0) + (pastItem.qty ?? 1));
     }
-    setQuantities(newQty);
+    // Merge into existing cart — never wipe what's already there
+    setQuantities(prev => {
+      const merged = { ...prev };
+      for (const [idStr, qty] of Object.entries(newQty)) {
+        const id = Number(idStr);
+        merged[id] = Math.min(10, (merged[id] ?? 0) + qty);
+      }
+      return merged;
+    });
     setAdjustments({});
     setAdjustingItem(null);
     setAdjustInput("");
